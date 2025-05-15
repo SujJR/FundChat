@@ -8,8 +8,8 @@ class MongoDBService:
     def __init__(self):
         try:
             # Hardcoded MongoDB connection settings
-            mongodb_uri = "mongodb+srv://sjr290904:290904sept@cluster0.a87nnrd.mongodb.net/fundchat"
-            db_name = "fundchat"
+            mongodb_uri = MONGODB_URI
+            db_name = MONGODB_DB_NAME
             
             self.client = MongoClient(mongodb_uri)
             self.db = self.client[db_name]
