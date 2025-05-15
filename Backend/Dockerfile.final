@@ -1,0 +1,636 @@
+# Use an official Python runtime as a parent image
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install required system packages including Poppler and Tesseract
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libmagic1 \
+    gcc \
+    build-essential \
+    poppler-utils \
+    tesseract-ocr \
+    libtesseract-dev \
+    libleptonica-dev \
+    pkg-config \
+    wget \
+    python3-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# Verify Tesseract installation and link it properly if needed
+RUN tesseract --version && \
+    which tesseract && \
+    ln -sf $(which tesseract) /usr/local/bin/tesseract || true
+
+# Copy requirements but exclude problematic packages
+COPY requirements.txt .
+
+# Install pip and OCR dependencies
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install unstructured_pytesseract pytesseract && \
+    pip install pdf2image PyPDF2 && \
+    grep -v "triton\|nvidia" requirements.txt > requirements_filtered.txt && \
+    pip install --no-cache-dir -r requirements_filtered.txt
+
+# Install torch without CUDA
+RUN pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+# Create a simpler document processor that doesn't rely on OCR
+RUN mkdir -p /app/app/services
+COPY ./app ./app
+
+# Create a improved document processor fallback method
+COPY <<'EOF' /app/app/services/document_processor_fixed.py
+import os
+import datetime
+import uuid
+from typing import Dict, Optional, List
+import hashlib
+from app.services.mongodb_service import MongoDBService
+from app.config.settings import settings
+import pinecone
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import Pinecone
+import shutil
+import PyPDF2
+from tqdm import tqdm
+
+class DocumentProcessor:
+    def __init__(self):
+        try:
+            # Initialize the OpenAI embedding model
+            self.embedding_model = OpenAIEmbeddings()
+            
+            # Initialize Pinecone
+            api_key = settings.PINECONE_API_KEY
+            cloud = settings.PINECONE_CLOUD
+            region = settings.PINECONE_REGION
+            
+            pinecone.init(api_key=api_key, cloud=cloud, region=region)
+            
+            # Get or create the Pinecone index
+            self.index_name = settings.PINECONE_INDEX_NAME
+            self.namespace = settings.PINECONE_NAMESPACE
+            
+            # Check if index exists, if not create it
+            if self.index_name not in pinecone.list_indexes():
+                print(f"Creating Pinecone index: {self.index_name}")
+                pinecone.create_index(
+                    name=self.index_name,
+                    dimension=1536,  # OpenAI embeddings dimension
+                    metric="cosine"
+                )
+            
+            # Connect to the index
+            self.index = pinecone.Index(self.index_name)
+            
+            # Setup documents directory
+            self.documents_path = settings.DOCUMENTS_PATH
+            os.makedirs(self.documents_path, exist_ok=True)
+            
+            print(f"DocumentProcessor initialized with index: {self.index_name}")
+            
+        except Exception as e:
+            print(f"Error initializing DocumentProcessor: {e}")
+            self.index = None
+            
+    def save_file(self, content: bytes, filename: str) -> str:
+        """
+        Save uploaded file to disk and return the file path
+        """
+        try:
+            # Create a unique filename to avoid collisions
+            file_hash = hashlib.md5(content).hexdigest()[:8]
+            base_name, extension = os.path.splitext(filename)
+            unique_filename = f"{base_name}_{file_hash}{extension}"
+            
+            file_path = os.path.join(self.documents_path, unique_filename)
+            
+            # Write file to disk
+            with open(file_path, "wb") as f:
+                f.write(content)
+                
+            print(f"File saved: {file_path}")
+            return file_path
+            
+        except Exception as e:
+            print(f"Error saving file {filename}: {e}")
+            raise
+
+    def _add_to_pinecone(self, text: str, metadata: Dict) -> str:
+        """
+        Add text to Pinecone vector store with metadata
+        """
+        try:
+            # Generate a unique ID for the document
+            doc_id = str(uuid.uuid4())
+            
+            # Add metadata to the document
+            metadata['doc_id'] = doc_id
+            
+            # Split text into chunks for embedding
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=200,
+            )
+            chunks = text_splitter.split_text(text)
+            
+            # Create a vectorstore
+            pinecone_index = Pinecone.from_existing_index(
+                index_name=self.index_name,
+                embedding=self.embedding_model,
+                text_key="text",
+                namespace=self.namespace
+            )
+            
+            # Add documents to the vectorstore with the metadata
+            for idx, chunk in enumerate(chunks):
+                chunk_metadata = metadata.copy()
+                chunk_metadata['chunk_id'] = f"{doc_id}_{idx}"
+                chunk_metadata['chunk_num'] = idx
+                chunk_metadata['chunk_count'] = len(chunks)
+                
+                pinecone_index.add_texts(
+                    texts=[chunk],
+                    metadatas=[chunk_metadata],
+                    ids=[f"{doc_id}_{idx}"]
+                )
+                
+            print(f"Added document with ID {doc_id} to Pinecone: {len(chunks)} chunks")
+            return doc_id
+            
+        except Exception as e:
+            print(f"Error adding to Pinecone: {e}")
+            raise
+            
+    def process_file(self, file_path, fund_id):
+        """
+        Process a file, extract text, add to vector store
+        """
+        try:
+            file_extension = os.path.splitext(file_path)[1].lower()
+            file_name = os.path.basename(file_path)
+            
+            print(f"Processing file: {file_path}")
+            
+            # Extract text from the file
+            text = ""
+            if file_extension == '.pdf':
+                try:
+                    print("Using PyPDF2 for text extraction")
+                    with open(file_path, "rb") as f:
+                        pdf_reader = PyPDF2.PdfReader(f)
+                        for page_num in range(len(pdf_reader.pages)):
+                            page_text = pdf_reader.pages[page_num].extract_text() or ""
+                            text += page_text + "\n"
+                            
+                    if not text.strip():
+                        print(f"PyPDF2 extracted empty text from {file_path}")
+                        text = f"[Unable to extract text from PDF: {file_name}]"
+                except Exception as pdf_e:
+                    print(f"Error extracting text with PyPDF2: {pdf_e}")
+                    text = f"[Error extracting text from PDF: {file_name}]"
+            else:
+                try:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        text = f.read()
+                except UnicodeDecodeError:
+                    try:
+                        with open(file_path, "r", encoding="latin-1") as f:
+                            text = f.read()
+                    except Exception as e:
+                        print(f"Error reading file with encoding: {e}")
+                        text = f"[Error reading file: {file_name}]"
+                
+            # Add document to Pinecone
+            if not text or text.strip() == "":
+                print(f"Warning: Extracted text is empty for {file_path}")
+                return False
+                
+            print(f"Extracted {len(text)} characters from {file_path}")
+            
+            # Add metadata
+            metadata = {
+                "file_name": file_name,
+                "file_type": file_extension.replace(".", ""),
+                "fund_id": fund_id,
+                "created_at": datetime.datetime.utcnow().isoformat(),
+            }
+            
+            # Add to Pinecone
+            doc_id = self._add_to_pinecone(text, metadata)
+            
+            # Add to MongoDB
+            mongodb_service = MongoDBService()
+            mongodb_service.add_document_to_fund(
+                fund_id=fund_id,
+                doc_data={
+                    "file_name": file_name,
+                    "file_type": file_extension.replace(".", ""),
+                    "doc_id": doc_id,
+                    "size_bytes": os.path.getsize(file_path),
+                }
+            )
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error processing file {file_path}: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+EOF
+
+# Replace the original document processor with the fixed one
+RUN cp /app/app/services/document_processor_fixed.py /app/app/services/document_processor.py
+
+# Create and use a modified main.py file to handle OpenAI quota errors
+COPY <<'EOF' /app/app/main_fixed.py
+import os
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from typing import List, Dict, Any, Optional
+
+import uvicorn
+from app.config.settings import settings
+from app.models.models import (
+    QueryRequest, QueryResponse, 
+    DocumentUploadResponse, 
+    FundResponse, FundListResponse,
+    ChatRequest, ChatResponse
+)
+from app.services.document_processor import DocumentProcessor
+from app.services.rag_service import RAGService
+from app.services.mongodb_service import MongoDBService
+from openai import OpenAI
+
+app = FastAPI(title=settings.APP_NAME)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  
+    allow_credentials=True,
+    allow_methods=["*"], 
+    allow_headers=["*"],  
+)
+
+document_processor = DocumentProcessor()
+rag_service = RAGService(document_processor)
+mongodb_service = MongoDBService()
+openai_client = OpenAI(api_key=settings.OPENAI_API_KEY)
+
+@app.on_event("startup")
+async def startup_db_client():
+    """Check MongoDB connection on startup"""
+    try:
+        if mongodb_service.client:            
+            mongodb_service.db.command('ping')
+            print("Successfully connected to MongoDB Atlas!")
+            print(f"Database: {settings.MONGODB_DB_NAME}")
+            
+            collections = mongodb_service.db.list_collection_names()
+            if collections:
+                print(f"   Collections: {', '.join(collections)}")
+            else:
+                print("   No collections found. They will be created automatically.")
+        else:
+            print("Failed to connect to MongoDB. Services requiring MongoDB may not work.")
+    except Exception as e:
+        print(f"MongoDB connection error: {e}")
+        print("   Services requiring MongoDB may not work properly.")
+
+@app.get("/")
+def read_root():
+    return {"message": "Welcome to the RAG API"}
+
+@app.post("/api/upload", response_model=List[DocumentUploadResponse])
+async def upload_document(
+    files: List[UploadFile] = File(...),
+    fund_name: str = Form(...)
+):
+    responses = []
+    
+    try:
+        processed_documents = []
+        for file in files:
+            try:
+                content = await file.read()
+                file_path = document_processor.save_file(content, file.filename)
+                
+                file_extension = os.path.splitext(file.filename)[1].lower()
+                
+                if file_extension == '.pdf':
+                    try:
+                        import PyPDF2
+                        with open(file_path, 'rb') as pdf_file:
+                            pdf_reader = PyPDF2.PdfReader(pdf_file)
+                            file_content = ""
+                            for page_num in range(len(pdf_reader.pages)):
+                                page_text = pdf_reader.pages[page_num].extract_text() or ""
+                                file_content += page_text + "\n"
+                        processed_documents.append(file_content)
+                    except Exception as pdf_e:
+                        print(f"Error extracting PDF with PyPDF2: {pdf_e}")
+                        processed_documents.append(f"[Content from PDF file {file.filename} - could not extract text]")
+                else:
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            file_content = f.read()
+                            processed_documents.append(file_content)
+                    except UnicodeDecodeError:
+                        try:
+                            with open(file_path, 'r', encoding='latin-1') as f:
+                                file_content = f.read()
+                                processed_documents.append(file_content)
+                        except Exception as e:
+                            print(f"Error reading file with encodings: {e}")
+                            processed_documents.append(f"[Could not extract text from {file.filename}]")
+                    
+                responses.append(DocumentUploadResponse(
+                    filename=file.filename,
+                    status="success",
+                    message="Document uploaded successfully"
+                ))
+            except Exception as e:
+                responses.append(DocumentUploadResponse(
+                    filename=file.filename,
+                    status="error",
+                    message=f"Error: {str(e)}"
+                ))
+        
+        fund_summary = "No content available for summary"
+        if processed_documents:
+            try:
+                # Use only the first document
+                first_doc_content = processed_documents[0] if processed_documents else ""
+                
+                char_limit = 4000 * 10
+                context = first_doc_content[:char_limit]
+                
+                try:
+                    response = openai_client.chat.completions.create(
+                        model="gpt-4o",
+                        messages=[
+                        {"role": "system", "content": "You are an assistant that creates concise fund summaries."},
+                        {"role": "user", "content": f"Create a brief summary of this fund based on the following document excerpt (first 10 pages):\n{context}"}
+                        ],
+                        max_tokens=800
+                    )
+                    fund_summary = response.choices[0].message.content.strip()
+                    print(f"Generated summary: {fund_summary}")
+                except Exception as api_e:
+                    print(f"OpenAI API error: {api_e}")
+                    if "quota" in str(api_e).lower():
+                        fund_summary = "No summary available - OpenAI API quota exceeded. Please update your billing information."
+                    else:
+                        fund_summary = "Summary generation failed. Please try again later."
+            except Exception as summary_e:
+                print(f"Error generating summary: {summary_e}")
+                fund_summary = "Error generating summary"
+        
+        # Create fund in MongoDB
+        fund_data = {
+            "fund_name": fund_name,
+            "summary": fund_summary
+        }
+        
+        fund_id = mongodb_service.create_fund(fund_data)
+        
+        if not fund_id:
+            raise HTTPException(status_code=500, detail="Failed to create fund in database")
+        
+        # Process each file
+        for idx, file in enumerate(files):
+            try:
+                await file.seek(0)
+                content = await file.read()
+                
+                file_path = document_processor.save_file(content, file.filename)
+                success = document_processor.process_file(file_path, fund_id)
+                
+                if not success:
+                    responses[idx].status = "warning"
+                    responses[idx].message = "Document uploaded but text extraction may be incomplete"
+            except Exception as e:
+                responses[idx].status = "error"
+                responses[idx].message = f"Error: {str(e)}"
+        
+        # Add fund_id to all responses
+        for response in responses:
+            response.fund_id = fund_id
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creating fund: {str(e)}")
+    
+    return responses
+
+@app.post("/api/query", response_model=QueryResponse, response_model_exclude={"sources"})
+async def query(request: QueryRequest):
+    try:
+        answer, sources = rag_service.query(
+            request.query, 
+            request.fund_id,
+            request.top_k
+        )
+        return QueryResponse(answer=answer, sources=sources)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/funds", response_model=FundListResponse)
+async def list_funds():
+    """List all available funds"""
+    try:
+        funds_raw = mongodb_service.list_funds()
+        funds_processed = []
+        for fund in funds_raw:
+            print(f"Processing fund: {fund['_id']}")
+            fund_copy = fund.copy()
+            # Rename _id to fund_id and convert ObjectId to string if needed
+            if '_id' in fund_copy:
+                fund_copy['fund_id'] = str(fund_copy['_id'])
+                del fund_copy['_id']  # Remove the original _id field
+            funds_processed.append(fund_copy)
+        result = FundListResponse(funds=funds_processed)
+        print(f"Funds processed: {result}")
+        return result
+    except Exception as e:
+        print(f"Error listing funds: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/funds/{fund_id}", response_model=FundResponse)
+async def get_fund(fund_id: str):
+    """Get information about a specific fund, generating summary if needed"""
+    try:
+        fund = mongodb_service.get_fund(fund_id)
+        if not fund:
+            raise HTTPException(status_code=404, detail=f"Fund {fund_id} not found")
+
+        if fund.get("summary") == "Empty":
+            print(f"Generating summary for fund {fund_id}...")
+            try:
+                summary_query = "Provide a good summary of this fund based on the available documents."
+                generated_summary, _ = rag_service.query(summary_query, fund_id)
+                
+                if generated_summary and generated_summary != "I don't have enough information to answer this question.":
+                    update_success = mongodb_service.update_fund_summary(fund_id, generated_summary)
+                    if update_success:
+                        fund = mongodb_service.get_fund(fund_id)
+                        if not fund:
+                             raise HTTPException(status_code=500, detail="Failed to retrieve updated fund data after summary generation")
+                    else:
+                         print(f"Warning: Failed to update summary for fund {fund_id}")
+                else:
+                    print(f"Info: Could not generate summary for fund {fund_id}. Keeping original.")
+
+            except Exception as summary_e:
+                print(f"Error generating or updating summary for fund {fund_id}: {summary_e}")
+                raise HTTPException(status_code=500, detail=f"Error during summary generation: {summary_e}")
+
+        # Convert MongoDB document format to match FundResponse model
+        fund_copy = fund.copy()
+        if '_id' in fund_copy:
+            fund_copy['fund_id'] = str(fund_copy['_id'])
+            del fund_copy['_id']  # Remove the original _id field
+
+        return FundResponse(**fund_copy)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/funds/{fund_id}/chat", response_model=ChatResponse)
+async def chat_with_fund(fund_id: str, request: ChatRequest):
+    """Chat with the documents associated with a specific fund"""
+    try:
+        # Check if fund exists
+        fund = mongodb_service.get_fund(fund_id)
+        if not fund:
+            raise HTTPException(status_code=404, detail=f"Fund {fund_id} not found")
+
+        answer, sources = rag_service.query(
+            query=request.message, 
+            fund_id=fund_id,
+            top_k=request.top_k
+        )
+        return ChatResponse(answer=answer, sources=sources)
+    except HTTPException:
+        # Re-raise HTTPExceptions directly
+        raise
+    except Exception as e:
+        print(f"Error during chat for fund {fund_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"An error occurred during chat: {str(e)}")
+
+@app.get("/api/mongodb/status")
+async def mongodb_status():
+    """Check MongoDB connection status"""
+    try:
+        if mongodb_service.client:
+            mongodb_service.db.command('ping')
+            collections = mongodb_service.db.list_collection_names()
+            return {
+                "status": "connected",
+                "database": settings.MONGODB_DB_NAME,
+                "collections": collections
+            }
+        else:
+            return {
+                "status": "disconnected",
+                "message": "MongoDB client not initialized"
+            }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+@app.get("/api/health")
+async def health_check():
+    """Check the overall health of the application"""
+    health = {
+        "status": "ok",
+        "components": {}
+    }
+    
+    # Check MongoDB
+    try:
+        if mongodb_service.client:
+            mongodb_service.db.command('ping')
+            health["components"]["mongodb"] = {
+                "status": "ok"
+            }
+        else:
+            health["components"]["mongodb"] = {
+                "status": "error",
+                "message": "MongoDB client not initialized"
+            }
+            health["status"] = "degraded"
+    except Exception as e:
+        health["components"]["mongodb"] = {
+            "status": "error",
+            "message": str(e)
+        }
+        health["status"] = "degraded"
+    
+    # Check Pinecone
+    try:
+        index_stats = document_processor.index.describe_index_stats()
+        health["components"]["pinecone"] = {
+            "status": "ok",
+            "namespaces": list(index_stats.get("namespaces", {}).keys()),
+            "vector_count": index_stats.get("total_vector_count", 0)
+        }
+    except Exception as e:
+        health["components"]["pinecone"] = {
+            "status": "error",
+            "message": str(e)
+        }
+        health["status"] = "degraded"
+    
+    # Check OpenAI
+    try:
+        # Simple test to check if OpenAI API key is valid
+        response = openai_client.models.list()
+        health["components"]["openai"] = {
+            "status": "ok"
+        }
+    except Exception as e:
+        health["components"]["openai"] = {
+            "status": "error",
+            "message": str(e)
+        }
+        health["status"] = "degraded"
+    
+    return health
+
+if __name__ == "__main__":
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+EOF
+
+# Replace the original main.py with fixed version
+RUN cp /app/app/main_fixed.py /app/app/main.py
+
+EXPOSE 8000
+
+# Environment variables
+ENV OPENAI_API_KEY="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"
+ENV APP_NAME="FundChat RAG API"
+ENV DOCUMENTS_PATH="/app/documents"
+ENV VECTORDB_PATH="/app/vectordb"
+ENV MONGODB_URI="mongodb+srv://sjr290904:290904sept@cluster0.a87nnrd.mongodb.net/fundchat"
+ENV MONGODB_DB_NAME="fundchat"
+ENV PINECONE_API_KEY="pcsk_5toio8_UaQsSqBPmDY7kN3xqTLDhV5YvVMa3woqz3XNSRcj2i4gJstvXe7FbgHGCbkuWC3"
+ENV PINECONE_INDEX_NAME="fundchat"
+ENV PINECONE_CLOUD="aws"
+ENV PINECONE_REGION="us-east-1"
+ENV PINECONE_NAMESPACE="documents"
+ENV OCR_AGENT="tesseract_ocr"
+ENV PATH="/usr/bin:/usr/local/bin:${PATH}"
+
+# Create documents directory
+RUN mkdir -p /app/documents
+
+# Modify the PATH to ensure Tesseract can be found
+RUN echo 'export PATH="/usr/bin:/usr/local/bin:$PATH"' >> /etc/profile
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

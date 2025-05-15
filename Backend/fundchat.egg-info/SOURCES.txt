@@ -1,0 +1,7 @@
+README.md
+setup.py
+fundchat.egg-info/PKG-INFO
+fundchat.egg-info/SOURCES.txt
+fundchat.egg-info/dependency_links.txt
+fundchat.egg-info/requires.txt
+fundchat.egg-info/top_level.txt

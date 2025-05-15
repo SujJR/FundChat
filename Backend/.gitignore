@@ -1,0 +1,9 @@
+.env
+docs/
+samples/
+.venv/
+.vercel
+app/documents/sample_docs
+__pycache__/
+venv/
+documents/

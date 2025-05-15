@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: fundchat
+Version: 0.1
+Requires-Dist: langchain>=0.3.25
+Requires-Dist: langchain-openai>=0.3.16
+Requires-Dist: uvicorn>=0.34.2
+Requires-Dist: fastapi>=0.115.12
+Dynamic: requires-dist
